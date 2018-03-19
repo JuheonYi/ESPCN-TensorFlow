@@ -33,7 +33,7 @@ class ESPCN(object):
         self.input2 = tf.placeholder(tf.float32, [None, None, None, self.channels], name='input_LR_unkown')
         
         #bicubic
-        self.bicubic = tf.image.resize_images(self.input, [self.patch_shape[0], self.patch_shape[1]], tf.image.ResizeMethod.NEAREST_NEIGHBOR)
+        self.bicubic = tf.image.resize_images(self.input, [self.patch_shape[0], self.patch_shape[1]], tf.image.ResizeMethod.BICUBIC)
 
         #original HR
         self.Ground_truth = tf.placeholder(tf.float32, [self.batch_size, self.patch_shape[0], self.patch_shape[0], self.channels], name='ground_truth')
@@ -70,9 +70,13 @@ class ESPCN(object):
         valid_LR = [doresize(xx, [self.input_size,]*2) for xx in valid]
         valid_HR = np.array(valid).astype(np.float32)
         valid_LR = np.array(valid_LR).astype(np.float32)
-
-        #save_images(valid_LR, [8, 8], './samples/inputs_small.png')
-        #save_images(valid_HR, [8, 8], './samples/reference.png')
+        if self.mode == "YCbCr":
+            valid_RGB_HR =  np.copy(valid_HR)
+            valid_HR = np.split(valid_RGB_HR,3, axis=3)[0]
+            valid_RGB_LR = np.copy(valid_LR)
+            valid_LR = np.split(valid_RGB_LR,3, axis=3)[0]
+            #valid_HR = np.array(valid_HR).astype(np.float32)
+            #valid_LR = np.array(valid_LR).astype(np.float32)
 
         counter = 1
         start_time = time.time()
@@ -84,8 +88,6 @@ class ESPCN(object):
         else:
             print(" Training starts from beginning")
 
-        # we only save the validation inputs once
-        have_saved_inputs = False
         for epoch in range(self.config.epoch):
             batch_idxs = min(len(self.imdb), self.config.train_size) // self.config.batch_size
 
@@ -111,16 +113,13 @@ class ESPCN(object):
                     print("Epoch: [%2d] [%4d/%4d] time: %4.4f, loss: %.8f" %(epoch, idx, batch_idxs, time.time() - start_time, loss))
                     self.save(self.config.checkpoint_dir)
 
-            """
+            
             if epoch % 500 == 0:
-                valid_output, loss, up_inputs = self.sess.run([self.output, self.loss, self.bicubic],
-                        feed_dict={self.input: valid_LR, self.Ground_truth: valid_HR})
-                if not have_saved_inputs:
-                    save_images(up_inputs, [8, 8], './samples/inputs.png')
-                    have_saved_inputs = True
-                save_images(valid_output, [8, 8], './samples/valid_%s_%s.png' % (epoch, idx))
-                #print("Validation loss: %.8f" % (loss))
-            """ 
+                #valid_output, loss, up_inputs = self.sess.run([self.output, self.loss, self.bicubic],
+                #        feed_dict={self.input: valid_LR, self.Ground_truth: valid_HR})
+                loss = self.sess.run([self.loss],feed_dict={self.input: valid_LR, self.Ground_truth: valid_HR})
+                print("Validation loss: %.8f" % (loss[0]))
+             
             # occasional testing
             if epoch % 500 == 0:
                 avg_PSNR, avg_PSNR_bicubic = self.test(load = False)
