@@ -3,204 +3,250 @@ import os
 import time
 from glob import glob
 import tensorflow as tf
-from six.moves import xrange
-from scipy.misc import imresize
+import scipy.misc
 from subpixel import PS
+import numpy as np
 
-from ops import *
 from utils import *
 
-def doresize(x, shape):
-    x = np.copy((x+1.)*127.5).astype("uint8")
-    y = imresize(x, shape)
-    return y
-
-class DCGAN(object):
-    def __init__(self, sess, image_size=128, is_crop=True,
-                 batch_size=64, image_shape=[128, 128, 3],
-                 y_dim=None, z_dim=100, gf_dim=64, df_dim=64,
-                 gfc_dim=1024, dfc_dim=1024, c_dim=3, dataset_name='default',
-                 checkpoint_dir=None):
-        """
-
-        Args:
-            sess: TensorFlow session
-            batch_size: The size of batch. Should be specified before training.
-            y_dim: (optional) Dimension of dim for y. [None]
-            z_dim: (optional) Dimension of dim for Z. [100]
-            gf_dim: (optional) Dimension of gen filters in first conv layer. [64]
-            df_dim: (optional) Dimension of discrim filters in first conv layer. [64]
-            gfc_dim: (optional) Dimension of gen untis for for fully connected layer. [1024]
-            dfc_dim: (optional) Dimension of discrim units for fully connected layer. [1024]
-            c_dim: (optional) Dimension of image color. [3]
-        """
+class ESPCN(object):
+    def __init__(self, sess, config, imdb):
         self.sess = sess
-        self.is_crop = is_crop
-        self.batch_size = batch_size
-        self.image_size = image_size
-        self.input_size = 32
-        self.sample_size = batch_size
-        self.image_shape = image_shape
-
-        self.y_dim = y_dim
-        self.z_dim = z_dim
-
-        self.gf_dim = gf_dim
-        self.df_dim = df_dim
-
-        self.gfc_dim = gfc_dim
-        self.dfc_dim = dfc_dim
-
-        self.c_dim = 3
-
-        self.dataset_name = dataset_name
-        self.checkpoint_dir = checkpoint_dir
+        self.config = config
+        self.batch_size = config.batch_size
+        self.valid_size = config.batch_size
+        self.patch_shape = config.patch_shape
+        self.input_size = int(config.patch_shape[0]/config.scale)
+        self.scale = config.scale
+        self.dataset_name = config.dataset
+        self.mode = config.mode
+        self.channels = config.channels
+        self.checkpoint_dir = config.checkpoint_dir
         self.build_model()
+        tf.global_variables_initializer().run(session=self.sess)
+        
+        self.imdb = imdb
 
     def build_model(self):
-
-        self.inputs = tf.placeholder(tf.float32, [self.batch_size, self.input_size, self.input_size, 3],
-                                    name='real_images')
-        try:
-            self.up_inputs = tf.image.resize_images(self.inputs, self.image_shape[0], self.image_shape[1], tf.image.ResizeMethod.NEAREST_NEIGHBOR)
-        except ValueError:
-            # newer versions of tensorflow
-            self.up_inputs = tf.image.resize_images(self.inputs, [self.image_shape[0], self.image_shape[1]], tf.image.ResizeMethod.NEAREST_NEIGHBOR)
-
-        self.images = tf.placeholder(tf.float32, [self.batch_size] + self.image_shape,
-                                    name='real_images')
-        self.sample_images= tf.placeholder(tf.float32, [self.sample_size] + self.image_shape,
-                                        name='sample_images')
-
-        self.G = self.generator(self.inputs)
-
-        #tf.image_summary should be renamed to tf.summary.image
-        #self.G_sum = tf.image_summary("G", self.G)
-        self.G_sum = tf.summary.image("G", self.G)
-
-        self.g_loss = tf.reduce_mean(tf.square(self.images-self.G))
-
-        #https://stackoverflow.com/questions/41066244/tensorflow-module-object-has-no-attribute-scalar-summary
-        #tf.scalar_summary() function was moved in the master branch, after the 0.12 release. 
-        #self.g_loss_sum = tf.scalar_summary("g_loss", self.g_loss)
-        self.g_loss_sum = tf.summary.scalar("g_loss", self.g_loss)
-
-        t_vars = tf.trainable_variables()
-        #print("number of variables:",len(t_vars),", full list:",t_vars)
+        #LR
+        self.input = tf.placeholder(tf.float32, [self.batch_size, self.input_size, self.input_size, self.channels], name='input_LR') 
+        self.input2 = tf.placeholder(tf.float32, [None, None, None, self.channels], name='input_LR_unkown')
         
-        self.g_vars = [var for var in t_vars if 'g_' in var.name]
+        #bicubic
+        self.bicubic = tf.image.resize_images(self.input, [self.patch_shape[0], self.patch_shape[1]], tf.image.ResizeMethod.NEAREST_NEIGHBOR)
 
-        self.saver = tf.train.Saver()
+        #original HR
+        self.Ground_truth = tf.placeholder(tf.float32, [self.batch_size, self.patch_shape[0], self.patch_shape[0], self.channels], name='ground_truth')
+        
+        #output HR
+        self.output = self.network(self.input)
+        self.output2 = self.network2(self.input2)
 
-    def train(self, config):
-        """Train DCGAN"""
-        # first setup validation data
-        data = sorted(glob(os.path.join("./data", config.dataset, "valid", "*.jpg")))
+        self.loss = tf.reduce_mean(tf.square(self.Ground_truth-self.output))
+        self.vars = tf.trainable_variables()
+        print("Number of variables in network:",len(self.vars),", full list:",self.vars)
+        self.optimizer = tf.train.AdamOptimizer(self.config.learning_rate).minimize(self.loss, var_list=self.vars)
 
-        g_optim = tf.train.AdamOptimizer(config.learning_rate, beta1=config.beta1) \
-                          .minimize(self.g_loss, var_list=self.g_vars)
-        #tf.initialize_all_variables().run()
-        tf.global_variables_initializer().run()
-
-        self.saver = tf.train.Saver()
-        #tf.summary.merge or tf.contrib.deprecated.merge_summary
-        #self.g_sum = tf.merge_summary([self.G_sum, self.g_loss_sum])
-        self.g_sum = tf.summary.merge([self.G_sum, self.g_loss_sum])
-        #tf.train.SummaryWriter is deprecated, instead use tf.summary.FileWriter.
-        #self.writer = tf.train.SummaryWriter("./logs", self.sess.graph)
+        self.output_summary = tf.summary.image("output", self.output)
+        self.loss_summary = tf.summary.scalar("loss", self.loss)
+        self.summary_merged = tf.summary.merge([self.output_summary, self.loss_summary])
         self.writer = tf.summary.FileWriter("./logs", self.sess.graph)
+        self.saver = tf.train.Saver()
 
-        sample_files = data[0:self.sample_size]
-        sample = [get_image(sample_file, self.image_size, is_crop=self.is_crop) for sample_file in sample_files]
-        sample_inputs = [doresize(xx, [self.input_size,]*2) for xx in sample]
-        sample_images = np.array(sample).astype(np.float32)
-        sample_input_images = np.array(sample_inputs).astype(np.float32)
+    def train(self, config, load = True):
+        # setup train/validation data
+        valid = sorted(glob(os.path.join(self.config.valid.hr_path, "*.png")))
+        #train = sorted(glob(os.path.join(config.train.hr_path, "*.png")))
+        shuffle(valid)
+        #shuffle(train)
+        #print("Preparing DIV2K images...")
+        #img_num = 800
+        #start_time = time.time()
+        #train = create_imdb(img_num, self.mode)
+        #print("%d images loaded! setting took: %4.4fs" % (len(train), time.time() - start_time))
+        
+        valid_files = valid[0:self.valid_size]
+        valid = [load_image(valid_file, self.mode) for valid_file in valid_files]
+        valid_LR = [doresize(xx, [self.input_size,]*2) for xx in valid]
+        valid_HR = np.array(valid).astype(np.float32)
+        valid_LR = np.array(valid_LR).astype(np.float32)
 
-        save_images(sample_input_images, [8, 8], './samples/inputs_small.png')
-        save_images(sample_images, [8, 8], './samples/reference.png')
+        #save_images(valid_LR, [8, 8], './samples/inputs_small.png')
+        #save_images(valid_HR, [8, 8], './samples/reference.png')
 
         counter = 1
         start_time = time.time()
-
-        if self.load(self.checkpoint_dir):
-            print(" [*] Load SUCCESS")
+        if load == True:
+            if self.load(self.checkpoint_dir):
+                print(" [*] Load SUCCESS")
+            else:
+                print(" [!] Load failed...")
         else:
-            print(" [!] Load failed...")
+            print(" Training starts from beginning")
 
         # we only save the validation inputs once
         have_saved_inputs = False
+        for epoch in range(self.config.epoch):
+            batch_idxs = min(len(self.imdb), self.config.train_size) // self.config.batch_size
 
-        for epoch in xrange(config.epoch):
-            data = sorted(glob(os.path.join("./data", config.dataset, "train", "*.jpg")))
-            batch_idxs = min(len(data), config.train_size) // config.batch_size
-
-            for idx in xrange(0, batch_idxs):
-                batch_files = data[idx*config.batch_size:(idx+1)*config.batch_size]
-                batch = [get_image(batch_file, self.image_size, is_crop=self.is_crop) for batch_file in batch_files]
-                input_batch = [doresize(xx, [self.input_size,]*2) for xx in batch]
-                batch_images = np.array(batch).astype(np.float32)
-                batch_inputs = np.array(input_batch).astype(np.float32)
-
-                # Update G network
-                _, summary_str, errG = self.sess.run([g_optim, self.g_sum, self.g_loss],
-                    feed_dict={ self.inputs: batch_inputs, self.images: batch_images })
+            for idx in range(0, batch_idxs):
+                #batch_files = train[idx*self.config.batch_size:(idx+1)*self.config.batch_size]
+                #batch = [load_image(batch_file, self.mode) for batch_file in batch_files]
+                #batch_LR = [doresize(xx, [self.input_size,]*2) for xx in batch]
+                batch, batch_LR = get_batch(self.imdb, idx*self.batch_size, self.batch_size, self.patch_shape[0], self.scale, 
+                                            augmentation = False)
+                batch_HR = np.array(batch).astype(np.float32)
+                batch_LR = np.array(batch_LR).astype(np.float32)
+                if self.mode == "YCbCr":
+                    RGB_HR =  np.copy(batch_HR)
+                    batch_HR = np.split(RGB_HR,3, axis=3)[0]
+                    RGB_LR = np.copy(batch_LR)
+                    batch_LR = np.split(RGB_LR,3, axis=3)[0]
+                #print("batch_HR:",batch_HR.shape,batch_LR.shape)
+                _, summary_str, loss = self.sess.run([self.optimizer, self.summary_merged, self.loss],
+                    feed_dict={ self.input: batch_LR, self.Ground_truth: batch_HR })
                 self.writer.add_summary(summary_str, counter)
+                counter+=1
+                if idx % 500 == 1 and epoch % 100 == 0:
+                    print("Epoch: [%2d] [%4d/%4d] time: %4.4f, loss: %.8f" %(epoch, idx, batch_idxs, time.time() - start_time, loss))
+                    self.save(self.config.checkpoint_dir)
 
-                counter += 1
-                print("Epoch: [%2d] [%4d/%4d] time: %4.4f, g_loss: %.8f" \
-                    % (epoch, idx, batch_idxs,
-                        time.time() - start_time, errG))
-
-                if np.mod(counter, 100) == 1:
-                    samples, g_loss, up_inputs = self.sess.run(
-                        [self.G, self.g_loss, self.up_inputs],
-                        feed_dict={self.inputs: sample_input_images, self.images: sample_images}
-                    )
-                    if not have_saved_inputs:
-                        save_images(up_inputs, [8, 8], './samples/inputs.png')
-                        have_saved_inputs = True
-                    save_images(samples, [8, 8],
-                                './samples/valid_%s_%s.png' % (epoch, idx))
-                    print("[Sample] g_loss: %.8f" % (g_loss))
-
-                if np.mod(counter, 500) == 2:
-                    self.save(config.checkpoint_dir, counter)
-
-    def generator(self, z):
-        # project `z` and reshape
-        self.h0, self.h0_w, self.h0_b = deconv2d(z, [self.batch_size, 32, 32, self.gf_dim], k_h=1, k_w=1, d_h=1, d_w=1, name='g_h0', with_w=True)
-        h0 = lrelu(self.h0)
-
-        self.h1, self.h1_w, self.h1_b = deconv2d(h0, [self.batch_size, 32, 32, self.gf_dim], name='g_h1', d_h=1, d_w=1, with_w=True)
-        h1 = lrelu(self.h1)
-
-        h2, self.h2_w, self.h2_b = deconv2d(h1, [self.batch_size, 32, 32, 3*16], d_h=1, d_w=1, name='g_h2', with_w=True)
-        h2 = PS(h2, 4, color=True)
+            """
+            if epoch % 500 == 0:
+                valid_output, loss, up_inputs = self.sess.run([self.output, self.loss, self.bicubic],
+                        feed_dict={self.input: valid_LR, self.Ground_truth: valid_HR})
+                if not have_saved_inputs:
+                    save_images(up_inputs, [8, 8], './samples/inputs.png')
+                    have_saved_inputs = True
+                save_images(valid_output, [8, 8], './samples/valid_%s_%s.png' % (epoch, idx))
+                #print("Validation loss: %.8f" % (loss))
+            """ 
+            # occasional testing
+            if epoch % 500 == 0:
+                avg_PSNR, avg_PSNR_bicubic = self.test(load = False)
+                print("Epoch: [%2d] test PSNR: %.6f, bicubic: %.6f" % (epoch, avg_PSNR, avg_PSNR_bicubic))
+        self.save(self.config.checkpoint_dir)
+    
+    def test(self, name = "Set5", load = True):
+        result_dir = os.path.join("./samples/",str(name))
+        if not os.path.exists(result_dir):
+            os.makedirs(result_dir)
+        img_list = sorted(glob(os.path.join("/home/johnyi/deeplearning/research/SISR_Datasets/test/",str(name),"*.png")))
         
-        return tf.nn.tanh(h2)
+        if load == True:
+            if self.load(self.checkpoint_dir):
+                print(" [*] Load SUCCESS")
+            else:
+                print(" [!] Load failed...")
+        avg_PSNR = 0
+        avg_PSNR_bicubic = 0
+        for i in range(0,len(img_list)):
+            image = load_image(img_list[i], self.mode)
+            image_w = self.scale * int(image.shape[0]/self.scale)
+            image_h = self.scale * int(image.shape[1]/self.scale)
+            #image = imresize(image,[image_w, image_h], interp='bicubic')
+            #LR = imresize(image,[int(image_w/self.scale), int(image_h/self.scale)], interp='bicubic')
+            #out_bicubic = imresize(LR,[image_w, image_h], interp='bicubic')
+            image = imresize(image,[image_w, image_h])
+            LR = imresize(image,[int(image_w/self.scale), int(image_h/self.scale)])
+            out_bicubic = imresize(LR,[image_w, image_h])
+            if self.mode == "RGB":
+                imageio.imwrite(result_dir+"/original_"+str(i)+".png", image)
+                imageio.imwrite(result_dir+"/bicubic_"+str(i)+".png", out_bicubic)
+            else:
+                img_rgb = load_image(img_list[i], "RGB")
+                img_rgb = imresize(img_rgb,[image_w, image_h])
+                LR_rgb = imresize(img_rgb,[int(image_w/self.scale), int(image_h/self.scale)], interp='bicubic')
+                out_bicubic_rgb = imresize(LR_rgb,[image_w, image_h], interp='bicubic')
+                imageio.imwrite(result_dir+"/original_"+str(i)+".png", img_rgb)
+                imageio.imwrite(result_dir+"/bicubic_"+str(i)+".png", out_bicubic_rgb)
+            PSNR = 0
+            PSNR_bicubic = 0
+            if self.mode == "RGB":
+                [out] = self.sess.run([self.output2], feed_dict={ self.input2: [LR]})
+                #print("out shape:",out.shape)
+                out = PS(out, self.scale, color=True)
+                #out = (1+np.tanh(out.eval()[0]))*255/2
+                out = np.round((1+np.tanh(out.eval()[0]))*255/2)
+                out = out.astype(np.uint8) #Q) is this needed? 
+                #out_bicubic = imresize(LR,[image_w, image_h])
+                PSNR = calc_PSNR(out,image)
+                PSNR_bicubic = calc_PSNR(out_bicubic,image)
+                avg_PSNR += PSNR
+                avg_PSNR_bicubic += PSNR_bicubic
+                #imageio.imwrite(result_dir+"/original_"+str(i)+".png", image)
+                imageio.imwrite(result_dir+"/HR_RGB_"+str(i)+".png", out)
+                #imageio.imwrite(result_dir+"/bicubic_"+str(i)+".png", out_bicubic)
+            else:
+                Y_HR = np.split(image,3, axis=2)[0]
+                YCbCr_LR =  np.copy(LR)
+                Y_LR = np.split(YCbCr_LR,3, axis=2)[0]
+                #print("Y_LR shape:",Y_LR.shape)
+                Cb_LR = np.split(YCbCr_LR,3, axis=2)[1]
+                Cr_LR = np.split(YCbCr_LR,3, axis=2)[2]
+                [out] = self.sess.run([self.output2], feed_dict={ self.input2: [Y_LR]})
+                #print("out shape:",out.shape)
+                out = PS_1dim(out[0], self.scale)
+                #print("out:",Y_LR.shape, out.shape)
+                #out = ((1+np.tanh(out))*(235-16)/2) + 16
+                out = np.round(((1+np.tanh(out))*(235-16)/2) + 16)
+                out = out.astype(np.uint8) #Q) is this needed? 
+                out_bicubic = np.split(imresize(LR,[image_w, image_h], interp='bicubic'),3,axis=2)[0]
+                #out_bicubic = np.split(imresize(LR,[image_w, image_h]),3,axis=2)[0]
+                PSNR = calc_PSNR(out,Y_HR)
+                PSNR_bicubic = calc_PSNR(out_bicubic,Y_HR)
+                path = result_dir+"/HR_Y_"+str(i)+".png"
+                save_ycbcr_img(out, Cb_LR, Cr_LR, self.scale, path)
+                avg_PSNR += PSNR
+                avg_PSNR_bicubic += PSNR_bicubic
+            print("["+str(name)+"] image",i, "shape:",image.shape, "downsampled:", LR.shape, "PSNR:", PSNR, "bicubic:",PSNR_bicubic )
+        return avg_PSNR/len(img_list), avg_PSNR_bicubic/len(img_list)
 
-    def save(self, checkpoint_dir, step):
+    def network(self, LR):
+        feature_tmp = tf.layers.conv2d(LR, 64, 5, strides = 1, padding = 'SAME', name = 'CONV_1',
+                                kernel_initializer = tf.contrib.layers.xavier_initializer(), reuse=tf.AUTO_REUSE)
+        feature_tmp = tf.nn.relu(feature_tmp)
+        feature_tmp = tf.layers.conv2d(feature_tmp, 32, 3, strides = 1, padding = 'SAME', name = 'CONV_2',
+                                kernel_initializer = tf.contrib.layers.xavier_initializer(), reuse=tf.AUTO_REUSE)
+        feature_tmp = tf.nn.relu(feature_tmp)
+        feature_out = tf.layers.conv2d(feature_tmp, self.channels*self.scale*self.scale, 3, strides = 1, padding = 'SAME', 
+                        name = 'CONV_3', kernel_initializer = tf.contrib.layers.xavier_initializer(), reuse=tf.AUTO_REUSE)
+        #feature_out = PS(feature_out, self.scale, color=True)
+        if self.mode == "RGB":
+            feature_out = PS(feature_out, self.scale, color=True)
+            return tf.multiply(tf.add(tf.nn.tanh(feature_out),1),255/2)
+        else:
+            feature_out = PS(feature_out, self.scale, color=False)
+            return tf.add(tf.multiply(tf.add(tf.nn.tanh(feature_out),1),(235-16)/2), 16) #Y range is in 16-235
+        
+    def network2(self, LR):
+        feature_tmp = tf.layers.conv2d(LR, 64, 5, strides = 1, padding = 'SAME', name = 'CONV_1',
+                                kernel_initializer = tf.contrib.layers.xavier_initializer(), reuse=tf.AUTO_REUSE)
+        feature_tmp = tf.nn.relu(feature_tmp)
+        feature_tmp = tf.layers.conv2d(feature_tmp, 32, 3, strides = 1, padding = 'SAME', name = 'CONV_2',
+                                kernel_initializer = tf.contrib.layers.xavier_initializer(), reuse=tf.AUTO_REUSE)
+        feature_tmp = tf.nn.relu(feature_tmp)
+        feature_out = tf.layers.conv2d(feature_tmp, self.channels*self.scale*self.scale, 3, strides = 1, padding = 'SAME', 
+                        name = 'CONV_3', kernel_initializer = tf.contrib.layers.xavier_initializer(), reuse=tf.AUTO_REUSE)
+        return feature_out
+
+    def save(self, checkpoint_dir):
         model_name = "ESPCN"
-        model_dir = "%s_%s" % (self.dataset_name, self.batch_size)
+        model_dir = "%s" % (self.dataset_name)
         checkpoint_dir = os.path.join(checkpoint_dir, model_dir)
-
         if not os.path.exists(checkpoint_dir):
             os.makedirs(checkpoint_dir)
-
-        self.saver.save(self.sess,
-                        os.path.join(checkpoint_dir, model_name),
-                        global_step=step)
+        self.saver.save(self.sess, os.path.join(checkpoint_dir, model_name))
 
     def load(self, checkpoint_dir):
         print(" [*] Reading checkpoints...")
-
-        model_dir = "%s_%s" % (self.dataset_name, self.batch_size)
+        model_dir = "%s"% (self.dataset_name)
         checkpoint_dir = os.path.join(checkpoint_dir, model_dir)
-
         ckpt = tf.train.get_checkpoint_state(checkpoint_dir)
+        print("loading from ",checkpoint_dir)
         if ckpt and ckpt.model_checkpoint_path:
             ckpt_name = os.path.basename(ckpt.model_checkpoint_path)
-            self.saver.restore(self.sess, os.path.join(checkpoint_dir, ckpt_name))
+            self.saver.restore(self.sess, os.path.join(checkpoint_dir, "ESPCN"))
             return True
         else:
             return False
