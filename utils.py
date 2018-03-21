@@ -12,6 +12,7 @@ from subpixel import PS
 from random import shuffle
 import imageio
 import cv2
+import math
 
 def save_ycbcr_img(Y, Cb, Cr, scale, path):
     # upscale Cb and Cr
@@ -28,12 +29,21 @@ def doresize(x, shape):
     x = np.copy(x).astype(np.uint8)
     y = imresize(x, shape, interp='bicubic')
     return y
-
+'''
 def calc_PSNR(img1, img2):
     mse = np.mean( (img1 - img2) ** 2 )
     if mse == 0:
         return 100
     return 20 * np.log10(255.0 / np.sqrt(mse))
+'''
+def calc_PSNR(img1, img2):
+	#assume RGB image
+    target_data = np.array(img1, dtype=np.float64)
+    ref_data = np.array(img2,dtype=np.float64)
+    diff = ref_data - target_data
+    diff = diff.flatten('C')
+    rmse = math.sqrt(np.mean(diff ** 2.) )
+    return 20*math.log10(255.0/rmse)
 
 def load_image(image_path, mode = "RGB"):
     if mode == "RGB":

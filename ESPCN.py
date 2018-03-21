@@ -114,14 +114,14 @@ class ESPCN(object):
                     self.save(self.config.checkpoint_dir)
 
             
-            if epoch % 500 == 0:
+            #if epoch % 500 == 0:
                 #valid_output, loss, up_inputs = self.sess.run([self.output, self.loss, self.bicubic],
                 #        feed_dict={self.input: valid_LR, self.Ground_truth: valid_HR})
-                loss = self.sess.run([self.loss],feed_dict={self.input: valid_LR, self.Ground_truth: valid_HR})
-                print("Validation loss: %.8f" % (loss[0]))
+                #loss = self.sess.run([self.loss],feed_dict={self.input: valid_LR, self.Ground_truth: valid_HR})
+                #print("Validation loss: %.8f" % (loss[0]))
              
             # occasional testing
-            if epoch % 500 == 0:
+            if epoch % 1000 == 0:
                 avg_PSNR, avg_PSNR_bicubic = self.test(load = False)
                 print("Epoch: [%2d] test PSNR: %.6f, bicubic: %.6f" % (epoch, avg_PSNR, avg_PSNR_bicubic))
         self.save(self.config.checkpoint_dir)
